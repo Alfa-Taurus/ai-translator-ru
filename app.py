@@ -9,26 +9,24 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 DEFAULT_MODEL = "qwen/qwen3.7-flash"
 BASE_URL = "https://openrouter.ai/api/v1"
+CACHE_DIR = "./translation_cache"
 
 # ==========================================
-# 1. РАБОТА С EPUB (ЧТЕНИЕ И СБОРКА)
+# 1. РАБОТА С EPUB И ТЕКСТОМ
 # ==========================================
 
 def extract_chapters_from_epub(epub_path):
-    """Извлекает главы из EPUB в виде чистого текста."""
     book = epub.read_epub(epub_path)
     chapters = []
     for item in book.get_items():
         if item.get_type() == ebooklib.ITEM_DOCUMENT:
             soup = BeautifulSoup(item.get_body_content(), "html.parser")
             text = soup.get_text(separator="\n").strip()
-            # Пропускаем пустые и сугубо технические разметки
             if len(text.split()) > 60:
                 chapters.append(text)
     return chapters
 
 def build_epub_from_chapters(chapters, output_path, title="Переведенная книга"):
-    """Собирает список переведенных глав обратно в валидный EPUB с форматированием."""
     book = epub.EpubBook()
     book.set_identifier("ai-pipeline-novel-ru")
     book.set_title(title)
@@ -68,7 +66,7 @@ def build_epub_from_chapters(chapters, output_path, title="Переведенн�
     epub.write_epub(output_path, book)
 
 # ==========================================
-# 2. УСТОЙЧИВЫЙ КЛИЕНТ API (AUTO-RETRY)
+# 2. API КЛИЕНТ С ЗАЩИТОЙ ОТ СБОЕВ
 # ==========================================
 
 @retry(
@@ -77,11 +75,10 @@ def build_epub_from_chapters(chapters, output_path, title="Переведенн�
     reraise=True
 )
 def safe_chat_completion(client, **kwargs):
-    """Вызов OpenRouter API с автоматическим повтором при сбоях сети/DNS."""
     return client.chat.completions.create(**kwargs)
 
 # ==========================================
-# 3. ДВУХПРОХОДНЫЙ ПАЙПЛАЙН (2-PASS)
+# 3. ПОЛНОЦЕННЫЙ 2-PASS С КЭШИРОВАНИЕМ
 # ==========================================
 
 def run_translation_pipeline(epub_file, api_key, model_name=DEFAULT_MODEL, progress_cb=None):
@@ -90,21 +87,40 @@ def run_translation_pipeline(epub_file, api_key, model_name=DEFAULT_MODEL, progr
     total = len(raw_chapters)
     
     if total == 0:
-        raise ValueError("Не удалось извлечь главы из книги. Проверьте формат EPUB.")
+        raise ValueError("Не удалось извлечь главы из EPUB файла.")
+
+    base_name = os.path.splitext(os.path.basename(epub_file))[0]
+    book_cache_dir = os.path.join(CACHE_DIR, base_name)
+    os.makedirs(book_cache_dir, exist_ok=True)
 
     translated_chapters = []
     accumulated_glossary = {}
     prev_summary = "Начало книги."
 
     for idx, text in enumerate(raw_chapters, 1):
-        if progress_cb:
-            progress_cb(idx, total, f"Глава {idx}/{total}: Pass 1 (Анализ сюжета и сбор глоссария)...")
+        ch_txt_cache = os.path.join(book_cache_dir, f"{idx:03d}.txt")
+        ch_meta_cache = os.path.join(book_cache_dir, f"{idx:03d}_meta.json")
 
-        # --- PASS 1: САММАРИ И ГЛОССАРИЙ ---
+        # Если глава уже была переведена ранее — загружаем из кэша (Check-pointing)
+        if os.path.exists(ch_txt_cache) and os.path.exists(ch_meta_cache):
+            if progress_cb:
+                progress_cb(idx, total, f"Глава {idx}/{total}: Загружено из кэша...")
+            with open(ch_txt_cache, "r", encoding="utf-8") as f:
+                translated_chapters.append(f.read())
+            with open(ch_meta_cache, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+                prev_summary = meta.get("summary", prev_summary)
+                accumulated_glossary.update(meta.get("glossary", {}))
+            continue
+
+        if progress_cb:
+            progress_cb(idx, total, f"Глава {idx}/{total}: Pass 1 (Анализ сюжета и глоссария)...")
+
+        # --- PASS 1: АНАЛИЗ ---
         analysis_prompt = (
             "You are a professional literary editor. Analyze the chapter text and output strictly standard JSON:\n"
             "{\n"
-            '  "summary": "Brief plot summary in Russian (max 200 words)",\n'
+            '  "summary": "Brief plot summary in Russian (max 150 words)",\n'
             '  "new_glossary": {"Original Name/Term": "Русский перевод (Gender M/F)"}\n'
             "}"
         )
@@ -114,6 +130,7 @@ def run_translation_pipeline(epub_file, api_key, model_name=DEFAULT_MODEL, progr
             f"TEXT:\n{text[:6000]}"
         )
 
+        current_glossary = {}
         try:
             res_analysis = safe_chat_completion(
                 client,
@@ -127,14 +144,15 @@ def run_translation_pipeline(epub_file, api_key, model_name=DEFAULT_MODEL, progr
             )
             data = json.loads(res_analysis.choices[0].message.content)
             prev_summary = data.get("summary", prev_summary)
-            accumulated_glossary.update(data.get("new_glossary", {}))
+            current_glossary = data.get("new_glossary", {})
+            accumulated_glossary.update(current_glossary)
         except Exception as e:
             print(f"[Warning] Ошибка автоанализа главы {idx}: {e}")
 
         if progress_cb:
             progress_cb(idx, total, f"Глава {idx}/{total}: Pass 2 (Художественный перевод)...")
 
-        # --- PASS 2: ХУДОЖЕСТВЕННЫЙ ПЕРЕВОД ---
+        # --- PASS 2: ПЕРЕВОД ---
         trans_prompt = (
             "Ты — профессиональный художественный переводчик на русский язык.\n"
             "ПРАВИЛА:\n"
@@ -159,23 +177,30 @@ def run_translation_pipeline(epub_file, api_key, model_name=DEFAULT_MODEL, progr
             ],
             temperature=0.3
         )
-        translated_chapters.append(res_trans.choices[0].message.content.strip())
+        ch_translated = res_trans.choices[0].message.content.strip()
+        translated_chapters.append(ch_translated)
 
-    base_name = os.path.splitext(os.path.basename(epub_file))[0]
+        # Сохраняем на диск промежуточный результат (защита от потери прогресса)
+        with open(ch_txt_cache, "w", encoding="utf-8") as f:
+            f.write(ch_translated)
+        with open(ch_meta_cache, "w", encoding="utf-8") as f:
+            json.dump({"summary": prev_summary, "glossary": accumulated_glossary}, f, ensure_ascii=False, indent=2)
+
+    # Финальная сборка EPUB
     out_epub = f"{base_name}_RU.epub"
     build_epub_from_chapters(translated_chapters, out_epub, title=f"{base_name} (RU)")
     return out_epub
 
 # ==========================================
-# 4. ИНТЕРФЕЙСЫ (CLI И GRADIO WEB-GUI)
+# 4. СТАРТЕРЫ И ИНТЕРФЕЙС
 # ==========================================
 
 def main():
     parser = argparse.ArgumentParser(description="AI Novel Translator EPUB Pipeline")
     parser.add_argument("--file", help="Путь к файлу .epub")
     parser.add_argument("--key", help="OpenRouter API Key", default=os.getenv("OPENROUTER_API_KEY"))
-    parser.add_argument("--model", default=DEFAULT_MODEL, help="Модель (qwen/qwen3.7-flash, deepseek/deepseek-v4-flash-0731)")
-    parser.add_argument("--gui", action="store_true", help="Запустить браузерный интерфейс")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Модель для перевода")
+    parser.add_argument("--gui", action="store_true", help="Запустить Web GUI")
 
     args = parser.parse_args()
 
