@@ -1,280 +1,354 @@
+#!/usr/bin/env python3
+"""
+AI Literary Novel Translator (Async Streaming Pipeline)
+Асинхронный конвейерный перевод художественных EPUB-книг целиком (без дробления глав).
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
 import os
 import re
-import json
-import time
-import argparse
-import concurrent.futures
-from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import ebooklib
-from ebooklib import epub
 from bs4 import BeautifulSoup
-from openai import OpenAI
+from ebooklib import epub
 import json_repair
+from openai import AsyncOpenAI
 
 # ==========================================
-# КОНФИГУРАЦИЯ И ПУЛЫ МОДЕЛЕЙ
+# 0. ЛОГИРОВАНИЕ
 # ==========================================
 
-BASE_URL = "https://openrouter.ai/api/v1"
-CACHE_DIR = "./translation_cache"
-REQUEST_TIMEOUT = 35.0  # Жесткий таймаут: не даем эндпоинту висеть дольше 35 сек
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger("TranslatorPipeline")
 
-# Пул для Фазы 1 (Анализ сюжета, глоссарий, имена)
-MODELS_PASS1 = [
-    "deepseek/deepseek-chat",
-    "deepseek/deepseek-v4-flash-0731",
-    "qwen/qwen-2.5-72b-instruct",
-    "qwen/qwen3.7-flash"
-]
-
-# Пул для Фазы 2 (Художественный литературный перевод)
-MODELS_PASS2 = [
-    "deepseek/deepseek-v4-flash-0731",
-    "qwen/qwen-2.5-72b-instruct",
-    "deepseek/deepseek-chat",
-    "qwen/qwen3.7-flash"
-]
 
 # ==========================================
-# 1. ЗАЩИТА ПАМЯТИ И ПАРСИНГ JSON
+# 1. КОНФИГУРАЦИЯ И МОДЕЛИ ДАННЫХ
 # ==========================================
 
-REFUSAL_PATTERNS = [
-    r"i cannot fulfill", r"i am unable to", r"as an ai language model",
-    r"my safety policies", r"i must decline", r"violates safety guidelines",
-    r"content policy"
-]
+@dataclass(frozen=True)
+class PipelineConfig:
+    """Конфигурация параметров работы и пулов моделей."""
+    base_url: str = "https://openrouter.ai/api/v1"
+    cache_dir: Path = Path("./translation_cache")
+    request_timeout: float = 60.0
+    max_retries_per_model: int = 2
+    backoff_factor: float = 1.5
 
-def is_refusal(text: str) -> bool:
-    if not text:
-        return True
-    lowered = text.lower()
-    return any(re.search(p, lowered) for p in REFUSAL_PATTERNS)
+    # Количество одновременно выполняемых запросов на перевод
+    max_concurrent_translations: int = 15
 
-def clean_and_extract_json(raw_text: str) -> str:
-    """Вырезает чистый JSON-блок, отсекая случайные мысли и текст до/после."""
-    if not raw_text:
-        return ""
-    start = raw_text.find("{")
-    end = raw_text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return raw_text[start:end + 1]
-    return raw_text
+    # Пул моделей для Фазы 1 (Анализ сюжета и глоссарий)
+    models_pass1: List[str] = field(default_factory=lambda: [
+        "deepseek/deepseek-v4-flash-0731",
+        "deepseek/deepseek-v3.2",
+    ])
 
-def parse_and_validate_analysis(raw_text: str, fallback_summary: str) -> Tuple[str, Dict[str, str], bool]:
-    """Безопасно извлекает саммари и термины, устойчив к сбоям синтаксиса."""
-    if not raw_text or is_refusal(raw_text):
-        return fallback_summary, {}, False
+    # Пул моделей для Фазы 2 (Художественный перевод)
+    models_pass2: List[str] = field(default_factory=lambda: [
+        "deepseek/deepseek-v4-flash-0731",
+        "deepseek/deepseek-v3.2",
+    ])
 
-    cleaned_json_str = clean_and_extract_json(raw_text)
 
-    try:
-        data = json_repair.loads(cleaned_json_str)
-        if not isinstance(data, dict):
+@dataclass
+class ChapterMeta:
+    """Снимок контекста и накопленного глоссария для конкретной главы."""
+    summary: str
+    glossary: Dict[str, str] = field(default_factory=dict)
+
+
+# ==========================================
+# 2. ВАЛИДАЦИЯ ОТВЕТОВ LLM
+# ==========================================
+
+class Guardrails:
+    """Проверка отказов и безопасный парсинг JSON-ответов."""
+
+    _REFUSAL_REGEX = re.compile(
+        r"(i cannot fulfill|i am unable to|as an ai language model|"
+        r"my safety policies|i must decline|violates safety guidelines|content policy)",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def is_refusal(cls, text: Optional[str]) -> bool:
+        if not text:
+            return True
+        return bool(cls._REFUSAL_REGEX.search(text))
+
+    @staticmethod
+    def extract_json_block(raw_text: str) -> str:
+        """Извлекает JSON-блок, отсекая сопроводительный текст."""
+        if not raw_text:
+            return ""
+        start = raw_text.find("{")
+        end = raw_text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return raw_text[start : end + 1]
+        return raw_text
+
+    @classmethod
+    def parse_analysis(
+        cls, raw_text: str, fallback_summary: str
+    ) -> Tuple[str, Dict[str, str], bool]:
+        if not raw_text or cls.is_refusal(raw_text):
             return fallback_summary, {}, False
 
-        summary = data.get("summary")
-        glossary = data.get("new_glossary")
-
-        clean_summary = fallback_summary
-        if isinstance(summary, str) and len(summary.strip()) > 10 and not is_refusal(summary):
-            clean_summary = summary.strip()
-
-        clean_glossary = {}
-        if isinstance(glossary, dict):
-            for k, v in glossary.items():
-                if isinstance(k, str) and isinstance(v, str):
-                    k_clean = k.strip()
-                    v_clean = v.strip()
-                    if len(k_clean) > 1 and len(v_clean) > 1:
-                        clean_glossary[k_clean] = v_clean
-
-        return clean_summary, clean_glossary, True
-    except Exception:
-        return fallback_summary, {}, False
-
-# ==========================================
-# 2. ВЫЗОВЫ API С РОТАЦИЕЙ И FALLBACK
-# ==========================================
-
-def call_llm(client: OpenAI, models_pool: List[str], messages: List[dict], temperature: float = 0.3, is_pass1: bool = False) -> str:
-    """Отказоустойчивый вызов API с перебором моделей и датацентров."""
-    last_error = None
-    
-    for model in models_pool:
+        cleaned = cls.extract_json_block(raw_text)
         try:
-            extra_body = {
-                "provider": {
-                    "allow_fallbacks": True
-                }
-            }
-            # Глушим reasoning в Pass 1, чтобы избежать утечек CoT
-            if is_pass1:
-                extra_body["reasoning"] = {"effort": 0, "max_tokens": 0}
+            data = json_repair.loads(cleaned)
+            if not isinstance(data, dict):
+                return fallback_summary, {}, False
 
-            kwargs = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "timeout": REQUEST_TIMEOUT,
-                "extra_body": extra_body
-            }
-            if is_pass1:
-                kwargs["response_format"] = {"type": "json_object"}
+            summary = data.get("summary")
+            glossary = data.get("new_glossary")
 
-            response = client.chat.completions.create(**kwargs)
-            if not response.choices or not response.choices[0].message.content:
-                raise ValueError("Пустой ответ от модели (NoneType)")
+            clean_summary = fallback_summary
+            if (
+                isinstance(summary, str)
+                and len(summary.strip()) > 10
+                and not cls.is_refusal(summary)
+            ):
+                clean_summary = summary.strip()
 
-            return response.choices[0].message.content.strip()
+            clean_glossary: Dict[str, str] = {}
+            if isinstance(glossary, dict):
+                for k, v in glossary.items():
+                    if isinstance(k, str) and isinstance(v, str):
+                        k_c, v_c = k.strip(), v.strip()
+                        if len(k_c) > 1 and len(v_c) > 1:
+                            clean_glossary[k_c] = v_c
 
+            return clean_summary, clean_glossary, True
+        except Exception:
+            return fallback_summary, {}, False
+
+
+# ==========================================
+# 3. КЭШИРОВАНИЕ
+# ==========================================
+
+class CacheManager:
+    """Управление файловым кэшем метаданных и переводов на диске."""
+
+    def __init__(self, cache_root: Path, book_id: str):
+        self.book_cache_dir = cache_root / book_id
+        self.book_cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _meta_path(self, idx: int) -> Path:
+        return self.book_cache_dir / f"{idx:03d}_meta.json"
+
+    def _text_path(self, idx: int) -> Path:
+        return self.book_cache_dir / f"{idx:03d}.txt"
+
+    def load_meta(self, idx: int) -> Optional[ChapterMeta]:
+        path = self._meta_path(idx)
+        if not path.exists():
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return ChapterMeta(
+                    summary=data.get("summary", ""),
+                    glossary=data.get("glossary", {}),
+                )
         except Exception as e:
-            err_msg = str(e)
-            print(f"[API Alert] Модель {model} споткнулась ({err_msg[:70]}). Переключаемся на резерв...")
-            last_error = e
-            time.sleep(0.8)
-            continue
+            logger.warning("Ошибка чтения метаданных главы %d: %s", idx, e)
+            return None
 
-    raise RuntimeError(f"Все модели из пула недоступны! Ошибка: {last_error}")
+    def save_meta(self, idx: int, meta: ChapterMeta) -> None:
+        path = self._meta_path(idx)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {"summary": meta.summary, "glossary": meta.glossary},
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+        except Exception as e:
+            logger.error("Ошибка сохранения метаданных главы %d: %s", idx, e)
+
+    def load_translation(self, idx: int) -> Optional[str]:
+        path = self._text_path(idx)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception as e:
+                logger.warning("Ошибка чтения кэша перевода главы %d: %s", idx, e)
+        return None
+
+    def save_translation(self, idx: int, content: str) -> None:
+        path = self._text_path(idx)
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            logger.error("Ошибка записи кэша перевода главы %d: %s", idx, e)
+
 
 # ==========================================
-# 3. EPUB ПАРСИНГ И СБОРКА
+# 4. АСИНХРОННЫЙ КЛИЕНТ LLM
 # ==========================================
 
-def extract_chapters_from_epub(epub_path: str) -> List[str]:
-    book = epub.read_epub(epub_path)
-    chapters = []
-    for item in book.get_items():
-        if item.get_type() == ebooklib.ITEM_DOCUMENT:
-            soup = BeautifulSoup(item.get_body_content(), "html.parser")
-            text = soup.get_text(separator="\n").strip()
-            # Отсекаем технические страницы с парой слов
-            if len(text.split()) > 60:
-                chapters.append(text)
-    return chapters
+class AsyncLLMService:
+    """Асинхронный клиент с перебором резервных моделей и экспоненциальным backoff."""
 
-def build_epub_from_chapters(chapters: List[str], output_path: str, title: str = "Переведенная книга"):
-    book = epub.EpubBook()
-    book.set_identifier("ai-literary-pipeline")
-    book.set_title(title)
-    book.set_language("ru")
-    book.add_author("AI Literary Translator")
+    def __init__(self, api_key: str, config: PipelineConfig):
+        self.client = AsyncOpenAI(api_key=api_key, base_url=config.base_url)
+        self.config = config
 
-    epub_chapters = []
-    spine_items = ["nav"]
+    async def call_with_fallback(
+        self,
+        models_pool: List[str],
+        messages: List[Dict[str, str]],
+        temperature: float = 0.3,
+        is_pass1: bool = False,
+    ) -> str:
+        last_error: Optional[Exception] = None
 
-    for i, raw_text in enumerate(chapters, 1):
-        paragraphs = raw_text.strip().split("\n")
-        html = f"<h2>Глава {i}</h2>\n"
-        for p in paragraphs:
-            p_clean = p.strip()
-            if p_clean:
-                html += f"<p>{p_clean}</p>\n"
+        for model in models_pool:
+            for attempt in range(1, self.config.max_retries_per_model + 1):
+                try:
+                    extra_body: Dict[str, Any] = {
+                        "provider": {"allow_fallbacks": True}
+                    }
+                    if is_pass1:
+                        extra_body["reasoning"] = {"effort": "none"}
 
-        c = epub.EpubHtml(title=f"Глава {i}", file_name=f"chapter_{i:03d}.xhtml", lang="ru")
-        c.content = html
-        book.add_item(c)
-        epub_chapters.append(c)
-        spine_items.append(c)
+                    kwargs: Dict[str, Any] = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "timeout": self.config.request_timeout,
+                        "extra_body": extra_body,
+                    }
+                    if is_pass1:
+                        kwargs["response_format"] = {"type": "json_object"}
 
-    book.toc = tuple(epub_chapters)
-    book.add_item(epub.EpubNcx())
-    book.add_item(epub.EpubNav())
+                    response = await self.client.chat.completions.create(**kwargs)
+                    if not response.choices or not response.choices[0].message.content:
+                        raise ValueError("Пустой ответ от модели")
 
-    style = """
+                    return response.choices[0].message.content.strip()
+
+                except Exception as e:
+                    last_error = e
+                    sleep_time = self.config.backoff_factor ** attempt
+                    logger.warning(
+                        "[%s] Сбой попытки %d: %s. Ожидание %.1f сек...",
+                        model,
+                        attempt,
+                        str(e)[:90],
+                        sleep_time,
+                    )
+                    await asyncio.sleep(sleep_time)
+
+        raise RuntimeError(f"Все модели из пула недоступны. Последняя ошибка: {last_error}")
+
+
+# ==========================================
+# 5. СЕРВИС EPUB
+# ==========================================
+
+class EpubService:
+    """Парсинг и генерация EPUB файлов."""
+
+    EPUB_CSS = """
     body { font-family: serif; margin: 5%; text-align: justify; line-height: 1.45; }
     h2 { text-align: center; margin-top: 1em; margin-bottom: 1.5em; }
     p { text-indent: 1.5em; margin: 0; margin-bottom: 0.3em; }
     """
-    nav_css = epub.EpubItem(uid="style_nav", file_name="style/nav.css", media_type="text/css", content=style)
-    book.add_item(nav_css)
-    book.spine = spine_items
 
-    epub.write_epub(output_path, book)
+    @classmethod
+    def extract_chapters(cls, epub_path: Path, min_word_count: int = 50) -> List[str]:
+        book = epub.read_epub(str(epub_path))
+        chapters: List[str] = []
+        for item in book.get_items():
+            if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                soup = BeautifulSoup(item.get_body_content(), "html.parser")
+                text = soup.get_text(separator="\n").strip()
+                if len(text.split()) >= min_word_count:
+                    chapters.append(text)
+        return chapters
+
+    @classmethod
+    def build_epub(cls, chapters: List[str], output_path: Path, title: str) -> None:
+        book = epub.EpubBook()
+        book.set_identifier("ai-literary-pipeline-async")
+        book.set_title(title)
+        book.set_language("ru")
+        book.add_author("AI Literary Translator")
+
+        epub_chapters = []
+        spine_items = ["nav"]
+
+        for idx, raw_text in enumerate(chapters, 1):
+            paragraphs = [p.strip() for p in raw_text.split("\n") if p.strip()]
+            html = f"<h2>Глава {idx}</h2>\n" + "".join(f"<p>{p}</p>\n" for p in paragraphs)
+
+            c = epub.EpubHtml(title=f"Глава {idx}", file_name=f"chapter_{idx:03d}.xhtml", lang="ru")
+            c.content = html
+            book.add_item(c)
+            epub_chapters.append(c)
+            spine_items.append(c)
+
+        book.toc = tuple(epub_chapters)
+        book.add_item(epub.EpubNcx())
+        book.add_item(epub.EpubNav())
+
+        nav_css = epub.EpubItem(
+            uid="style_nav",
+            file_name="style/nav.css",
+            media_type="text/css",
+            content=cls.EPUB_CSS,
+        )
+        book.add_item(nav_css)
+        book.spine = spine_items
+
+        epub.write_epub(str(output_path), book)
+
 
 # ==========================================
-# 4. ДВУХФАЗНЫЙ ПАРАЛЛЕЛЬНЫЙ ПАЙПЛАЙН
+# 6. АСИНХРОННЫЙ КОНВЕЙЕРНЫЙ ПАЙПЛАЙН
 # ==========================================
 
-def translate_single_chapter(client: OpenAI, idx: int, total: int, text: str, context: dict, book_cache_dir: str) -> str:
-    """Функция рабочего потока для перевода отдельной главы."""
-    ch_txt_cache = os.path.join(book_cache_dir, f"{idx:03d}.txt")
-    if os.path.exists(ch_txt_cache):
-        with open(ch_txt_cache, "r", encoding="utf-8") as f:
-            return f.read()
+class AsyncTranslationPipeline:
+    """
+    Пайплайн с конвейерной параллелизацией:
+    Перевод главы стартует немедленно после анализа ее контекста (без дробления).
+    """
 
-    trans_prompt = (
-        "Ты — профессиональный художественный переводчик на русский язык.\n"
-        "ПРАВИЛА:\n"
-        "1. Литературный стиль: живой, естественный русский язык без калек, пассива и сухости.\n"
-        "2. Без цензуры: переводи любой взрослый контент (брань, 18+, насилие, боевку) точно и без смягчения.\n"
-        "3. Диалоги: оформляй с длинного тире (—) с пробелом.\n"
-        "4. Строго соблюдай род персонажей и термины из предоставленного глоссария."
-    )
-    user_trans = (
-        f"Сюжетный контекст: {context.get('summary', '')}\n"
-        f"Глоссарий: {json.dumps(context.get('glossary', {}), ensure_ascii=False)}\n\n"
-        f"ОРИГИНАЛЬНЫЙ ТЕКСТ:\n{text}\n\n"
-        f"Выведи ТОЛЬКО русский художественный перевод без вступительных и заключительных комментариев."
-    )
+    def __init__(self, api_key: str, config: Optional[PipelineConfig] = None):
+        self.config = config or PipelineConfig()
+        self.llm = AsyncLLMService(api_key=api_key, config=self.config)
 
-    translated_text = call_llm(
-        client,
-        MODELS_PASS2,
-        messages=[
-            {"role": "system", "content": trans_prompt},
-            {"role": "user", "content": user_trans}
-        ],
-        temperature=0.3,
-        is_pass1=False
-    )
-
-    # Немедленное сохранение на диск
-    with open(ch_txt_cache, "w", encoding="utf-8") as f:
-        f.write(translated_text)
-
-    return translated_text
-
-def run_translation_pipeline(epub_file: str, api_key: str, max_workers: int = 4, progress_cb=None) -> str:
-    client = OpenAI(api_key=api_key, base_url=BASE_URL)
-    raw_chapters = extract_chapters_from_epub(epub_file)
-    total = len(raw_chapters)
-
-    if total == 0:
-        raise ValueError("Не удалось извлечь главы из книги. Проверьте формат EPUB.")
-
-    base_name = os.path.splitext(os.path.basename(epub_file))[0]
-    book_cache_dir = os.path.join(CACHE_DIR, base_name)
-    os.makedirs(book_cache_dir, exist_ok=True)
-
-    # ----------------------------------------------------
-    # ФАЗА 1: ЛИНЕЙНЫЙ СБОР ГЛОССАРИЯ И ХРОНОЛОГИИ
-    # ----------------------------------------------------
-    chapter_contexts = {}
-    accumulated_glossary = {}
-    prev_summary = "Начало книги."
-
-    print(f"\n[Фаза 1/2] Линейный анализ сюжета и сбор глоссария ({total} глав)...")
-
-    for idx, text in enumerate(raw_chapters, 1):
-        ch_meta_cache = os.path.join(book_cache_dir, f"{idx:03d}_meta.json")
-
-        if os.path.exists(ch_meta_cache):
-            with open(ch_meta_cache, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-                prev_summary = meta.get("summary", prev_summary)
-                accumulated_glossary.update(meta.get("glossary", {}))
-            chapter_contexts[idx] = {
-                "summary": prev_summary,
-                "glossary": accumulated_glossary.copy()
-            }
-            if progress_cb:
-                progress_cb(0.5 * (idx / total), desc=f"Фаза 1: Глава {idx}/{total} (из кэша)")
-            continue
-
-        if progress_cb:
-            progress_cb(0.5 * (idx / total), desc=f"Фаза 1: Анализ главы {idx}/{total}")
+    async def _analyze_chapter(
+        self,
+        idx: int,
+        text: str,
+        prev_summary: str,
+        accumulated_glossary: Dict[str, str],
+        cache: CacheManager,
+    ) -> ChapterMeta:
+        """Анализ сюжета главы и сбор глоссария."""
+        cached_meta = cache.load_meta(idx)
+        if cached_meta:
+            return cached_meta
 
         analysis_prompt = (
             "You are a professional literary editor. Analyze the chapter text and output strictly valid JSON:\n"
@@ -287,136 +361,256 @@ def run_translation_pipeline(epub_file: str, api_key: str, max_workers: int = 4,
             "- Do not include items already present in Known glossary.\n"
             "- Output raw JSON only."
         )
-        user_analysis = (
+        user_content = (
             f"Previous summary: {prev_summary}\n"
             f"Known glossary: {json.dumps(accumulated_glossary, ensure_ascii=False)}\n\n"
             f"TEXT:\n{text[:4500]}"
         )
 
         try:
-            raw_pass1 = call_llm(
-                client,
-                MODELS_PASS1,
+            raw_res = await self.llm.call_with_fallback(
+                models_pool=self.config.models_pass1,
                 messages=[
                     {"role": "system", "content": analysis_prompt},
-                    {"role": "user", "content": user_analysis}
+                    {"role": "user", "content": user_content},
                 ],
                 temperature=0.2,
-                is_pass1=True
+                is_pass1=True,
             )
-            prev_summary, new_terms, _ = parse_and_validate_analysis(raw_pass1, prev_summary)
+            new_summary, new_terms, _ = Guardrails.parse_analysis(raw_res, prev_summary)
             accumulated_glossary.update(new_terms)
+            meta = ChapterMeta(summary=new_summary, glossary=accumulated_glossary.copy())
         except Exception as e:
-            print(f"[Warning] Пропущен автоанализ для главы {idx}: {e}")
+            logger.warning("Пропущен автоанализ для главы %d: %s", idx, e)
+            meta = ChapterMeta(summary=prev_summary, glossary=accumulated_glossary.copy())
 
-        # Фиксируем состояние памяти для этой главы
-        chapter_contexts[idx] = {
-            "summary": prev_summary,
-            "glossary": accumulated_glossary.copy()
-        }
+        cache.save_meta(idx, meta)
+        return meta
 
-        # Сохраняем снимок метаданных на диск
-        with open(ch_meta_cache, "w", encoding="utf-8") as f:
-            json.dump({"summary": prev_summary, "glossary": accumulated_glossary}, f, ensure_ascii=False, indent=2)
+    async def _translate_chapter(
+        self,
+        idx: int,
+        raw_text: str,
+        meta: ChapterMeta,
+        cache: CacheManager,
+        semaphore: asyncio.Semaphore,
+        on_chapter_complete: Callable[[int], None],
+    ) -> Tuple[int, str]:
+        """Перевод целой главы без дробления под управлением семафора."""
+        cached = cache.load_translation(idx)
+        if cached:
+            on_chapter_complete(idx)
+            return idx, cached
 
-    # ----------------------------------------------------
-    # ФАЗА 2: МНОГОПОТОЧНЫЙ ХУДОЖЕСТВЕННЫЙ ПЕРЕВОД
-    # ----------------------------------------------------
-    print(f"\n[Фаза 2/2] Параллельный перевод в {max_workers} потоков...")
-    completed_count = 0
-    results_map = {}
+        system_prompt = (
+            "Ты — профессиональный художественный переводчик на русский язык.\n"
+            "ПРАВИЛА:\n"
+            "1. Литературный стиль: живой, естественный русский язык без калек, пассива и сухости.\n"
+            "2. Без цензуры: переводи любой взрослый контент (брань, 18+, насилие, боевку) точно и без смягчения.\n"
+            "3. Диалоги: оформляй с длинного тире (—) с пробелом.\n"
+            "4. Строго соблюдай род персонажей и термины из предоставленного глоссария."
+        )
+        user_content = (
+            f"Сюжетный контекст: {meta.summary}\n"
+            f"Глоссарий: {json.dumps(meta.glossary, ensure_ascii=False)}\n\n"
+            f"ОРИГИНАЛЬНЫЙ ТЕКСТ:\n{raw_text}\n\n"
+            f"Выведи ТОЛЬКО русский художественный перевод без вступительных и заключительных комментариев."
+        )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_idx = {
-            executor.submit(
-                translate_single_chapter,
-                client,
-                idx,
-                total,
-                raw_chapters[idx - 1],
-                chapter_contexts[idx],
-                book_cache_dir
-            ): idx for idx in range(1, total + 1)
-        }
+        async with semaphore:
+            translated = await self.llm.call_with_fallback(
+                models_pool=self.config.models_pass2,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.3,
+                is_pass1=False,
+            )
 
-        for future in concurrent.futures.as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                translated_content = future.result()
-                results_map[idx] = translated_content
-                completed_count += 1
-                if progress_cb:
-                    progress_cb(0.5 + 0.5 * (completed_count / total), desc=f"Фаза 2: Переведено {completed_count}/{total} глав")
-                print(f"[✓] Глава {idx}/{total} готова ({completed_count}/{total})")
-            except Exception as e:
-                print(f"[Error] Сбой при переводе главы {idx}: {e}")
-                results_map[idx] = f"[Ошибка перевода главы: {e}]"
+        cache.save_translation(idx, translated)
+        on_chapter_complete(idx)
+        return idx, translated
 
-    # Собираем главы в строгом хронологическом порядке 1..N
-    translated_chapters = [results_map[i] for i in range(1, total + 1)]
+    async def run(
+        self,
+        input_epub: Path,
+        output_epub: Optional[Path] = None,
+        max_workers: Optional[int] = None,
+        progress_cb: Optional[Callable[[float, str], None]] = None,
+    ) -> Path:
+        raw_chapters = EpubService.extract_chapters(input_epub)
+        total = len(raw_chapters)
+        if total == 0:
+            raise ValueError("Не удалось извлечь главы из книги.")
 
-    # Сборка финального EPUB
-    out_epub = f"{base_name}_RU.epub"
-    build_epub_from_chapters(translated_chapters, out_epub, title=f"{base_name} (RU)")
-    return out_epub
+        workers_count = max_workers or self.config.max_concurrent_translations
+        semaphore = asyncio.Semaphore(workers_count)
+
+        book_id = input_epub.stem
+        cache = CacheManager(self.config.cache_dir, book_id)
+
+        logger.info("Запуск конвейерного перевода: %d глав, пул: %d воркеров", total, workers_count)
+
+        completed_translations = 0
+        analyzed_chapters = 0
+
+        def update_progress(desc: str):
+            if progress_cb:
+                p = 0.3 * (analyzed_chapters / total) + 0.7 * (completed_translations / total)
+                progress_cb(min(p, 1.0), desc)
+
+        def on_chapter_translated(idx: int):
+            nonlocal completed_translations
+            completed_translations += 1
+            logger.info("[✓] Глава %d/%d переведена (%d/%d)", idx, total, completed_translations, total)
+            update_progress(f"Переведено глав: {completed_translations}/{total}")
+
+        # Потоковый конвейер: Анализ -> Немедленный запуск перевода главы целиком
+        translation_tasks: List[asyncio.Task] = []
+        current_summary = "Начало книги."
+        accumulated_glossary: Dict[str, str] = {}
+
+        for idx, text in enumerate(raw_chapters, 1):
+            update_progress(f"Анализ сюжета главы {idx}/{total}")
+
+            meta = await self._analyze_chapter(
+                idx=idx,
+                text=text,
+                prev_summary=current_summary,
+                accumulated_glossary=accumulated_glossary,
+                cache=cache,
+            )
+            current_summary = meta.summary
+            accumulated_glossary = meta.glossary
+            analyzed_chapters += 1
+
+            # Задача на перевод целой главы ставится в фоновый пул сразу же
+            task = asyncio.create_task(
+                self._translate_chapter(
+                    idx=idx,
+                    raw_text=text,
+                    meta=meta,
+                    cache=cache,
+                    semaphore=semaphore,
+                    on_chapter_complete=on_chapter_translated,
+                )
+            )
+            translation_tasks.append(task)
+
+        # Ожидаем завершения всех глав
+        results = await asyncio.gather(*translation_tasks, return_exceptions=True)
+
+        # Сборка итогового списка глав
+        translated_chapters: List[str] = []
+        for i, res in enumerate(results, 1):
+            if isinstance(res, Exception):
+                logger.error("Критический сбой перевода главы %d: %s", i, res)
+                translated_chapters.append(f"[Ошибка перевода главы {i}: {res}]")
+            else:
+                _, text = res
+                translated_chapters.append(text)
+
+        if output_epub is None:
+            output_epub = input_epub.parent / f"{book_id}_RU.epub"
+
+        EpubService.build_epub(
+            chapters=translated_chapters,
+            output_path=output_epub,
+            title=f"{book_id} (RU)",
+        )
+
+        if progress_cb:
+            progress_cb(1.0, "Готово!")
+
+        logger.info("Книга успешно сохранена: %s", output_epub)
+        return output_epub
+
 
 # ==========================================
-# 5. CLI И GRADIO WEB-ИНТЕРФЕЙС
+# 7. ИНТЕРФЕЙСЫ (CLI И GRADIO)
 # ==========================================
+
+def launch_web_gui():
+    import gradio as gr
+
+    async def web_process(epub_file, api_key: str, workers: int, progress=gr.Progress()):
+        if not epub_file:
+            return None, "Загрузите .epub файл."
+        if not api_key:
+            return None, "Введите OpenRouter API Key."
+
+        cfg = PipelineConfig(max_concurrent_translations=int(workers))
+        pipeline = AsyncTranslationPipeline(api_key=api_key, config=cfg)
+
+        def cb(frac, desc):
+            progress(frac, desc=desc)
+
+        try:
+            out_path = await pipeline.run(
+                input_epub=Path(epub_file.name),
+                max_workers=int(workers),
+                progress_cb=cb,
+            )
+            return str(out_path), "Перевод успешно завершен!"
+        except Exception as e:
+            logger.exception("Ошибка пайплайна")
+            return None, f"Ошибка пайплайна: {e}"
+
+    with gr.Blocks(title="AI Literary Novel Translator") as ui:
+        gr.Markdown("## ⚡ Fast Async AI Literary Translator (Streaming Pipeline)")
+        with gr.Row():
+            with gr.Column():
+                f_in = gr.File(label="Исходный EPUB", file_types=[".epub"])
+                k_in = gr.Textbox(
+                    label="OpenRouter API Key",
+                    type="password",
+                    value=os.getenv("OPENROUTER_API_KEY", ""),
+                    placeholder="sk-or-v1-...",
+                )
+                w_in = gr.Slider(
+                    minimum=2, maximum=30, value=15, step=1, label="Параллельных глав (Concurrency)"
+                )
+                btn = gr.Button("Начать перевод", variant="primary")
+            with gr.Column():
+                st = gr.Textbox(label="Статус", interactive=False)
+                f_out = gr.File(label="Готовая книга (.epub)")
+
+        btn.click(web_process, inputs=[f_in, k_in, w_in], outputs=[f_out, st])
+
+    ui.launch(inbrowser=True)
+
 
 def main():
-    parser = argparse.ArgumentParser(description="AI Literary Novel Translator")
-    parser.add_argument("--file", help="Входной .epub файл")
-    parser.add_argument("--key", help="OpenRouter API Key", default=os.getenv("OPENROUTER_API_KEY"))
-    parser.add_argument("--workers", type=int, default=4, help="Количество потоков (по умолчанию 4)")
-    parser.add_argument("--gui", action="store_true", help="Запустить Gradio Web GUI")
-
+    parser = argparse.ArgumentParser(description="Async Fast AI Literary Translator")
+    parser.add_argument("--file", type=Path, help="Входной .epub файл")
+    parser.add_argument("--key", default=os.getenv("OPENROUTER_API_KEY"), help="OpenRouter API Key")
+    parser.add_argument("--workers", type=int, default=15, help="Параллельных глав (по умолчанию 15)")
+    parser.add_argument("--gui", action="store_true", help="Запустить Web GUI")
     args = parser.parse_args()
 
     if args.gui or not args.file:
-        import gradio as gr
-
-        def web_ui(epub_obj, key, workers, progress=gr.Progress()):
-            if not epub_obj:
-                return None, "Загрузите файл .epub"
-            if not key:
-                return None, "Введите OpenRouter API Key"
-
-            def cb(frac, desc):
-                progress(frac, desc=desc)
-
-            try:
-                res = run_translation_pipeline(epub_obj.name, key, int(workers), cb)
-                return res, "Перевод успешно завершен!"
-            except Exception as e:
-                return None, f"Ошибка пайплайна: {str(e)}"
-
-        with gr.Blocks(title="AI Literary Translator") as ui:
-            gr.Markdown("## 📖 AI Literary Novel Translator (Decoupled 2-Phase)")
-            with gr.Row():
-                with gr.Column():
-                    f_in = gr.File(label="Исходный EPUB файл", file_types=[".epub"])
-                    k_in = gr.Textbox(label="OpenRouter API Key", type="password", placeholder="sk-or-v1-...")
-                    w_in = gr.Slider(minimum=1, maximum=8, value=4, step=1, label="Потоков перевода (Workers)")
-                    btn = gr.Button("Начать перевод", variant="primary")
-                with gr.Column():
-                    st = gr.Textbox(label="Статус выполнения", interactive=False)
-                    f_out = gr.File(label="Готовая книга (.epub)")
-
-            btn.click(web_ui, inputs=[f_in, k_in, w_in], outputs=[f_out, st])
-
-        ui.launch(inbrowser=True)
+        launch_web_gui()
     else:
         if not args.key:
-            print("Ошибка: Укажите API ключ через аргумент --key")
+            logger.error("Укажите API-ключ через --key или переменную OPENROUTER_API_KEY.")
             return
 
-        def cli_cb(frac, desc):
-            percent = int(frac * 100)
-            print(f"[{percent}%] {desc}")
+        cfg = PipelineConfig(max_concurrent_translations=args.workers)
+        pipeline = AsyncTranslationPipeline(api_key=args.key, config=cfg)
 
-        out = run_translation_pipeline(args.file, args.key, args.workers, cli_cb)
-        print(f"\n[✓] Готово! Сохранено в: {out}")
+        def cli_cb(frac, desc):
+            print(f"[{int(frac * 100):02d}%] {desc}")
+
+        out = asyncio.run(
+            pipeline.run(
+                input_epub=args.file,
+                max_workers=args.workers,
+                progress_cb=cli_cb,
+            )
+        )
+        print(f"\n[✓] Перевод завершен: {out}")
+
 
 if __name__ == "__main__":
     main()
