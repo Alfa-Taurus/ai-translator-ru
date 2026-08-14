@@ -5,3 +5,4 @@ gradio>=4.40.0
 rich>=13.7.0
 pyyaml>=6.0.1
 tenacity>=8.5.0
+json-repair>=0.28.0
