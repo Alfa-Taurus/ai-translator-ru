@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+venv/
+.env
+*.epub
+output_chapters/
+input_chapters/
+glossaries/
+flagged/
+.gradio/

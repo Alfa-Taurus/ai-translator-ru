@@ -1,0 +1,7 @@
+openai>=1.40.0
+ebooklib>=0.18
+beautifulsoup4>=4.12.0
+gradio>=4.40.0
+rich>=13.7.0
+pyyaml>=6.0.1
+tenacity>=8.5.0
