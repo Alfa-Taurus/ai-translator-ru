@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-AI Literary Novel Translator (Async Streaming Pipeline v3.3)
-- Исключены устаревшие эндпоинты и зацензуренные модели (Qwen, DeepSeek-Chat)
-- Пул моделей: DeepSeek V4 Flash + DeepSeek V3.2
-- Детектор дегенерации токенов (Anti-Syllable Soup)
-- Полный автоматический Fallback между моделями
-- Сохранение курсива/жирного шрифта в EPUB
+AI Literary Novel Translator (Async Streaming Pipeline v3.5 - Universal Dynamic Engine)
+- Динамическое извлечение персонажей и их пола без хардкода
+- Универсальные правила грамматического согласования рода в русском языке
+- Чистый сэмплинг без frequency_penalty (защита от словарных петель и мутаций слов)
+- Отказоустойчивый асинхронный конвейер с честными фолбеками
+- Сохранение форматирования (курсив, жирный, разделители сцен)
 """
 
 from __future__ import annotations
@@ -54,7 +54,7 @@ class PipelineConfig:
     backoff_factor: float = 1.5
     max_concurrent_translations: int = 15
 
-    # Фаза 1: Анализ сюжета и глоссарий
+    # Фаза 1: Анализ сюжета, извлечение терминов и пола персонажей
     models_pass1: List[str] = field(default_factory=lambda: [
         "deepseek/deepseek-v4-flash-0731",
         "deepseek/deepseek-v3.2",
@@ -95,7 +95,7 @@ class StatsTracker:
 
 @dataclass
 class ChapterMeta:
-    """Контекст и глоссарий для главы."""
+    """Контекст и накопленный глоссарий для главы."""
     summary: str
     glossary: Dict[str, str] = field(default_factory=dict)
 
@@ -144,7 +144,7 @@ class TextFormatter:
 
 
 class Guardrails:
-    """Фильтры отказов нейросети, детекторы дегенерации и нормализатор глоссария."""
+    """Многоуровневый фильтр отказов нейросети, детекции дегенерации и сбоев грамматики."""
 
     _REFUSAL_REGEX = re.compile(
         r"(i cannot fulfill|i am unable to|as an ai language model|"
@@ -153,8 +153,20 @@ class Guardrails:
         re.IGNORECASE,
     )
 
-    # Детектор «словесного крошева»: цепочки из 4+ однобуквенных слов подряд (например: "Р ожд этнич... пр ер в чила")
+    # 1. Детектор цепочек из одиночных букв (побайтовый распад)
     _SINGLE_CHAR_SOUP_REGEX = re.compile(r"(?:\b[а-яА-ЯёЁa-zA-Z]\b[\s\.,—\-]+){4,}")
+
+    # 2. Детектор мутаций глаголов (окончания на -лка, -аллка, -овалка и т.д.)
+    _MUTANT_VERBS_REGEX = re.compile(r"\b[а-яА-ЯёЁ]{3,}(?:илка|аллка|овалка|ергла|стоналлка|ложилка)\b", re.IGNORECASE)
+
+    # 3. Детектор заглавных букв внутри слова (ВайС, сказаЛА)
+    _IN_WORD_CAPS_REGEX = re.compile(r"\b[а-яА-ЯёЁa-zA-Z]+[А-ЯЁ][а-яА-ЯёЁ]+\b")
+
+    # 4. Детектор бесконечного словарного потока без знаков препинания (16+ слов подряд)
+    _ZERO_PUNCTUATION_LOOP_REGEX = re.compile(r"(?:\b[а-яА-ЯёЁa-zA-Z0-9-]+\b\s+){16,}[а-яА-ЯёЁa-zA-Z0-9-]+")
+
+    # 5. Детектор слива в чистый английский (12+ английских слов подряд)
+    _ENGLISH_LEAK_REGEX = re.compile(r"(?:\b[a-zA-Z]+\b[\s,;]+){12,}")
 
     @classmethod
     def is_refusal(cls, text: Optional[str]) -> bool:
@@ -164,30 +176,38 @@ class Guardrails:
 
     @classmethod
     def is_degenerated(cls, text: str) -> bool:
-        """Проверяет текст на коллапс токенизатора и зацикливание."""
-        if not text or len(text) < 50:
+        """Проверяет текст на любые проявления дегенерации и сбоев сэмплирования."""
+        if not text or len(text) < 40:
             return False
 
-        # 1. Поиск цепочек из изолированных букв
         if cls._SINGLE_CHAR_SOUP_REGEX.search(text):
+            logger.warning("[Guardrail Alert] Обнаружен побайтовый распад текста.")
             return True
 
-        # 2. Аномальный процент однобуквенных слов в тексте (> 18%)
-        words = [w for w in re.findall(r"\b\w+\b", text) if w]
-        if len(words) > 100:
-            single_letter_words = [w for w in words if len(w) == 1]
-            if len(single_letter_words) / len(words) > 0.18:
-                return True
+        if cls._MUTANT_VERBS_REGEX.search(text):
+            logger.warning("[Guardrail Alert] Обнаружены мутировавшие глагольные окончания (-лка).")
+            return True
 
-        # 3. Бесконечные циклы повторения одной фразы (3+ раза подряд)
-        if re.search(r"(.{20,})\1{3,}", text):
+        if cls._IN_WORD_CAPS_REGEX.search(text):
+            logger.warning("[Guardrail Alert] Обнаружен сбой регистра внутри слов (Капс-баг).")
+            return True
+
+        if cls._ZERO_PUNCTUATION_LOOP_REGEX.search(text):
+            logger.warning("[Guardrail Alert] Обнаружена словарная петля (Dictionary Loop).")
+            return True
+
+        if cls._ENGLISH_LEAK_REGEX.search(text):
+            logger.warning("[Guardrail Alert] Обнаружен непереведенный фрагмент на английском.")
+            return True
+
+        if re.search(r"(.{25,})\1{3,}", text):
+            logger.warning("[Guardrail Alert] Обнаружено бесконечное зацикливание фразы.")
             return True
 
         return False
 
     @classmethod
     def is_valid_translation(cls, text: Optional[str]) -> bool:
-        """Комплексная проверка валидности перевода."""
         if not text or len(text.strip()) < 10:
             return False
         if cls.is_refusal(text):
@@ -298,7 +318,7 @@ class CacheManager:
                     content = f.read().strip()
                 if Guardrails.is_valid_translation(content) and not content.startswith("[Ошибка перевода"):
                     return content
-                logger.warning("Кэш главы %d поврежден (дегенерация/ошибка). Удаляем для повторного перевода...", idx)
+                logger.warning("Кэш главы %d содержит дефекты. Удаляем для чистого перевода...", idx)
                 path.unlink(missing_ok=True)
             except Exception as e:
                 logger.warning("Ошибка чтения кэша главы %d: %s", idx, e)
@@ -318,7 +338,7 @@ class CacheManager:
 # ==========================================
 
 class AsyncLLMService:
-    """Отказоустойчивый клиент с защитой от дегенерации и гарантированным фолбеком."""
+    """Отказоустойчивый клиент с чистым сэмплированием и честным фолбеком."""
 
     def __init__(self, api_key: str, config: PipelineConfig, stats: StatsTracker):
         self.client = AsyncOpenAI(api_key=api_key, base_url=config.base_url)
@@ -329,7 +349,7 @@ class AsyncLLMService:
         self,
         models_pool: List[str],
         messages: List[Dict[str, str]],
-        temperature: float = 0.45,
+        temperature: float = 0.3,
         is_pass1: bool = False,
     ) -> str:
         last_error: Optional[Exception] = None
@@ -345,14 +365,13 @@ class AsyncLLMService:
                         "model": model,
                         "messages": messages,
                         "temperature": 0.2 if is_pass1 else temperature,
+                        "top_p": 0.95,
                         "timeout": self.config.request_timeout,
                         "extra_body": extra_body,
+                        # frequency_penalty строго 0.0 для исключения словарных петель
                     }
                     if is_pass1:
                         kwargs["response_format"] = {"type": "json_object"}
-                    else:
-                        # Штраф за повтор для предотвращения зацикливаний и крошева
-                        kwargs["frequency_penalty"] = 0.15
 
                     response = await self.client.chat.completions.create(**kwargs)
                     if not response.choices or not response.choices[0].message.content:
@@ -362,13 +381,13 @@ class AsyncLLMService:
 
                     # Проверка на отказ
                     if Guardrails.is_refusal(content):
-                        raise ValueError(f"Модель выдала отказ (refusal): {content[:120]}")
+                        raise ValueError(f"Модель выдала отказ: {content[:100]}")
 
-                    # Проверка на словесное крошево / дегенерацию токенизатора
+                    # Проверка на дегенерацию токенизатора
                     if not is_pass1 and Guardrails.is_degenerated(content):
-                        raise ValueError("Обнаружен коллапс токенизатора (словесное крошево). Бракуем ответ.")
+                        raise ValueError("Ответ отбракован (обнаружена дегенерация текста/мутация слов).")
 
-                    # Учет расхода токенов
+                    # Фиксация статистики токенов
                     usage = getattr(response, "usage", None)
                     if usage:
                         p_tok = getattr(usage, "prompt_tokens", 0) or 0
@@ -384,7 +403,7 @@ class AsyncLLMService:
                     
                     next_model_msg = ""
                     if attempt == self.config.max_retries_per_model and model_idx + 1 < len(models_pool):
-                        next_model_msg = f" -> Фолбек на модель '{models_pool[model_idx + 1]}'"
+                        next_model_msg = f" -> Переключение на резервную модель '{models_pool[model_idx + 1]}'"
                     
                     logger.warning(
                         "[%s] Попытка %d/%d сбой: %s.%s",
@@ -392,7 +411,7 @@ class AsyncLLMService:
                     )
                     await asyncio.sleep(sleep_time)
 
-        raise RuntimeError(f"Все модели пула {models_pool} не смогли перевести фрагмент. Ошибка: {last_error}")
+        raise RuntimeError(f"Все модели пула {models_pool} не справились с главой. Ошибка: {last_error}")
 
 
 # ==========================================
@@ -424,7 +443,7 @@ class EpubService:
     @classmethod
     def build_epub(cls, chapters: List[str], output_path: Path, title: str) -> None:
         book = epub.EpubBook()
-        book.set_identifier("ai-literary-pipeline-async-v3.3")
+        book.set_identifier("ai-literary-pipeline-async-v3.5")
         book.set_title(title)
         book.set_language("ru")
         book.add_author("AI Literary Translator")
@@ -480,14 +499,20 @@ class AsyncTranslationPipeline:
         if cached_meta:
             return cached_meta
 
+        # Универсальный промпт извлечения персонажей, их рода и терминов
         analysis_prompt = (
-            "You are a professional literary editor. Analyze the chapter text and output strictly valid JSON:\n"
+            "You are a professional literary editor and translator. Analyze the text and output strictly valid JSON:\n"
             "{\n"
             '  "summary": "Brief plot summary in Russian (max 120 words)",\n'
-            '  "new_glossary": {"Original Name/Term": "Русский перевод (Gender M/F)"}\n'
+            '  "new_glossary": {\n'
+            '    "Character Name": "Русский перевод (Пол: М / Ж / Ср)",\n'
+            '    "Term/Concept": "Русский перевод"\n'
+            "  }\n"
             "}\n"
             "Rules for new_glossary:\n"
-            "- Use natural Russian phonetics (e.g. Jaune -> Жон, Mercury -> Меркури).\n"
+            "- Carefully determine character gender by examining English pronouns in context (she/her -> Ж, he/him -> М).\n"
+            "- Always specify gender for characters explicitly, e.g.: 'OriginalName': 'РусскоеИмя (Пол: Ж)'.\n"
+            "- Use natural Russian phonetics and established translation conventions.\n"
             "- Do not include items already present in Known glossary.\n"
             "- Output raw JSON only."
         )
@@ -532,20 +557,29 @@ class AsyncTranslationPipeline:
             on_chapter_complete(idx)
             return idx, cached
 
+        # Универсальный промпт литературного перевода
         system_prompt = (
             "Ты — профессиональный художественный переводчик на русский язык.\n"
-            "ПРАВИЛА:\n"
-            "1. Литературный стиль: живой, естественный русский язык без калек, пассива и сухости.\n"
-            "2. Без цензуры: переводи любой взрослый контент (брань, 18+, насилие, боевку) точно и без смягчения.\n"
-            "3. Диалоги: оформляй с длинного тире (—) с пробелом.\n"
-            "4. Сохраняй авторские акценты (курсив *текст*, жирный **текст**, разделители сцен * * *).\n"
-            "5. Строго соблюдай род персонажей и термины из предоставленного глоссария."
+            "КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА ПЕРЕВОДА:\n"
+            "1. СТРОГОЕ СОГЛАСОВАНИЕ РОДА И ГЛАГОЛОВ:\n"
+            "   - Внимательно определяй пол персонажей по контексту, английским местоимениям (she/her -> женский род, he/him -> мужской род) и глоссарию.\n"
+            "   - Для персонажей женского пола глаголы прошедшего времени, краткие причастия и прилагательные ВСЕГДА ставь в ЖЕНСКИЙ род (сказала, пошла, заметила, была, ответила, вздохнула, нахмурилась).\n"
+            "   - Если иностранное женское имя оканчивается на согласную (напр. Вайсс, Элис, Элен) или не склоняется (напр. Руби, Мэри), глаголы и зависимые слова при нем ВСЕ РАВНО ОБЯЗАТЕЛЬНО ставятся в ЖЕНСКИЙ род!\n"
+            "2. ЛИТЕРАТУРНЫЙ РУССКИЙ ЯЗЫК:\n"
+            "   - Пиши живым, выразительным литературным языком без калек, сухости, мутаций слов и скачков регистра.\n"
+            "3. БЕЗ ЦЕНЗУРЫ:\n"
+            "   - Переводи любой взрослый контент (брань, 18+, насилие, эротику, боевку) точно, сочно и без купюр.\n"
+            "4. ДИАЛОГИ И ФОРМАТИРОВАНИЕ:\n"
+            "   - Прямую речь оформляй с длинного тире (—) с пробелом.\n"
+            "   - Бережно сохраняй разметку (*курсив*, **жирный**, разделители сцен * * *).\n"
+            "5. СТРОГО СОБЛЮДАЙ ПЕРЕВОД ТЕРМИНОВ И ИМЕН ИЗ ГЛОССАРИЯ.\n"
+            "6. Выводи ТОЛЬКО готовый русский художественный перевод без вступительных и заключительных комментариев."
         )
         user_content = (
             f"Сюжетный контекст: {meta.summary}\n"
-            f"Глоссарий: {json.dumps(meta.glossary, ensure_ascii=False)}\n\n"
+            f"Глоссарий и персонажи: {json.dumps(meta.glossary, ensure_ascii=False)}\n\n"
             f"ОРИГИНАЛЬНЫЙ ТЕКСТ:\n{raw_text}\n\n"
-            f"Выведи ТОЛЬКО русский художественный перевод без вступительных и заключительных комментариев."
+            f"Русский художественный перевод:"
         )
 
         async with semaphore:
@@ -555,7 +589,7 @@ class AsyncTranslationPipeline:
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                temperature=0.45,
+                temperature=0.3,
                 is_pass1=False,
             )
 
@@ -709,7 +743,7 @@ def launch_web_gui():
             return None, f"Ошибка пайплайна: {e}"
 
     with gr.Blocks(title="AI Literary Novel Translator") as ui:
-        gr.Markdown("## ⚡ Fast Async AI Literary Translator (Pipeline v3.3)")
+        gr.Markdown("## ⚡ Fast Async AI Literary Translator (Universal Dynamic Engine v3.5)")
         with gr.Row():
             with gr.Column():
                 f_in = gr.File(label="Исходный EPUB", file_types=[".epub"])
@@ -723,7 +757,7 @@ def launch_web_gui():
                     minimum=2, maximum=30, value=15, step=1, label="Параллельных глав (Concurrency)"
                 )
                 m1_in = gr.Textbox(
-                    label="Модели Фазы 1 (Анализ сюжета, через запятую)",
+                    label="Модели Фазы 1 (Анализ сюжета и глоссарий, через запятую)",
                     value="deepseek/deepseek-v4-flash-0731, deepseek/deepseek-v3.2",
                 )
                 m2_in = gr.Textbox(
@@ -741,7 +775,7 @@ def launch_web_gui():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Async Fast AI Literary Translator v3.3")
+    parser = argparse.ArgumentParser(description="Async Fast AI Literary Translator v3.5")
     parser.add_argument("--file", type=Path, help="Входной .epub файл")
     parser.add_argument("--key", default=os.getenv("OPENROUTER_API_KEY"), help="OpenRouter API Key")
     parser.add_argument("--workers", type=int, default=15, help="Параллельных глав (по умолчанию 15)")
