@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-AI Literary Novel Translator (Async Streaming Pipeline v3.7 - Stable Engine)
-- Полностью удален нестабильный V4 Flash
-- Основная модель: DeepSeek V3.2 (без цензуры, отличный русский слог)
-- Защита от сжигания входных токенов (Fast Failover при сбоях)
-- Полная динамическая грамматика рода и сохранение форматирования
+AI Literary Novel Translator (Async Streaming Pipeline v4.0 - Universal Dynamic Context)
+- Двухуровневый анализ: сущности + контекстные идиомы/полисемия (без хардкода)
+- Изоморфный перенос регистра (Mirror Register Transfer)
+- Поддержка внешнего пользовательского глоссария (Pre-seeded Glossary)
+- Выборочная регенерация глав (Selective Cache Invalidation)
+- Детерминированный линтер пунктуации и терминов перед сборкой EPUB
 """
 
 from __future__ import annotations
@@ -19,7 +20,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import ebooklib
 from bs4 import BeautifulSoup
@@ -45,15 +46,15 @@ logger = logging.getLogger("TranslatorPipeline")
 
 @dataclass(frozen=True)
 class PipelineConfig:
-    """Конфигурация пайплайна."""
+    """Конфигурация параметров работы пайплайна."""
     base_url: str = "https://openrouter.ai/api/v1"
     cache_dir: Path = Path("./translation_cache")
-    request_timeout: float = 90.0
+    request_timeout: float = 95.0
     max_retries_per_model: int = 2
     backoff_factor: float = 1.5
     max_concurrent_translations: int = 15
 
-    # Фаза 1: Анализ сюжета, извлечение терминов и пола персонажей
+    # Фаза 1: Анализ сюжета, терминов, пола и идиом
     models_pass1: List[str] = field(default_factory=lambda: [
         "deepseek/deepseek-v3.2",
     ])
@@ -92,17 +93,18 @@ class StatsTracker:
 
 @dataclass
 class ChapterMeta:
-    """Контекст и накопленный глоссарий для главы."""
+    """Контекст, глоссарий и идиомы для конкретной главы."""
     summary: str
     glossary: Dict[str, str] = field(default_factory=dict)
+    context_notes: Dict[str, str] = field(default_factory=dict)
 
 
 # ==========================================
-# 2. ФОРМАТИРОВАНИЕ И БЕЗОПАСНЫЙ ВАЛИДАТОР
+# 2. ТЕКСТОВЫЙ ФОРМАТТЕР И ЛИНТЕР
 # ==========================================
 
 class TextFormatter:
-    """Конвертер HTML <-> Markdown для сохранения авторского курсива и оформления."""
+    """Конвертер HTML <-> Markdown и детерминированный постобработчик."""
 
     @staticmethod
     def html_to_markdown(html_content: str) -> str:
@@ -139,6 +141,21 @@ class TextFormatter:
             html_parts.append(f"<p>{p_html}</p>")
         return "\n".join(html_parts)
 
+    @staticmethod
+    def post_lint(text: str, master_glossary: Dict[str, str]) -> str:
+        """Детерминированная нормализация пунктуации и типографики."""
+        # 1. Замена дефисов и коротких тире в начале реплик на длинное тире
+        text = re.sub(r"(?m)^[\-\–]\s*", "— ", text)
+        text = re.sub(r"(?<=[«\"\'\s])[\-\–]\s+", "— ", text)
+
+        # 2. Устранение множественных пробелов
+        text = re.sub(r"[ \t]+", " ", text)
+
+        # 3. Нормализация знаков препинания
+        text = re.sub(r"\s+([,\.\?!;:])", r"\1", text)
+
+        return text
+
 
 class Guardrails:
     """Безопасный валидатор без ложных срабатываний на русский язык."""
@@ -150,13 +167,8 @@ class Guardrails:
         re.IGNORECASE,
     )
 
-    # Детектор реальных мутаций сэмплирования (-аллка, -овалка)
     _MUTANT_VERBS_REGEX = re.compile(r"\b[а-яА-ЯёЁ]{3,}(?:аллка|овалка|стоналлка|ложилка|получилка|деформовалка)\b", re.IGNORECASE)
-
-    # Детектор словарных петель (30+ слов подряд без знаков препинания)
     _ZERO_PUNCTUATION_LOOP_REGEX = re.compile(r"(?:\b[а-яА-ЯёЁa-zA-Z0-9-]+\b\s+){30,}[а-яА-ЯёЁa-zA-Z0-9-]+")
-
-    # Детектор непереведенных кусков на английском (15+ английских слов подряд)
     _ENGLISH_LEAK_REGEX = re.compile(r"(?:\b[a-zA-Z]+\b[\s,;]+){15,}")
 
     @classmethod
@@ -171,32 +183,19 @@ class Guardrails:
             return False
 
         if cls._MUTANT_VERBS_REGEX.search(text):
-            logger.warning("[Guardrail] Зафиксированы мутировавшие суффиксы (-лка).")
+            logger.warning("[Guardrail] Обнаружены мутировавшие суффиксы.")
             return True
-
         if cls._ZERO_PUNCTUATION_LOOP_REGEX.search(text):
-            logger.warning("[Guardrail] Зафиксирована словарная петля (Dictionary Loop).")
+            logger.warning("[Guardrail] Обнаружена словарная петля (Dictionary Loop).")
             return True
-
         if cls._ENGLISH_LEAK_REGEX.search(text):
-            logger.warning("[Guardrail] Зафиксирован непереведенный блок на английском.")
+            logger.warning("[Guardrail] Обнаружен непереведенный английский фрагмент.")
             return True
-
         if re.search(r"(.{30,})\1{4,}", text):
-            logger.warning("[Guardrail] Зафиксировано бесконечное зацикливание текста.")
+            logger.warning("[Guardrail] Обнаружено циклическое зацикливание.")
             return True
 
         return False
-
-    @classmethod
-    def is_valid_translation(cls, text: Optional[str]) -> bool:
-        if not text or len(text.strip()) < 10:
-            return False
-        if cls.is_refusal(text):
-            return False
-        if cls.is_degenerated(text):
-            return False
-        return True
 
     @staticmethod
     def extract_json_block(raw_text: str) -> str:
@@ -209,12 +208,12 @@ class Guardrails:
         return raw_text
 
     @classmethod
-    def normalize_and_merge_glossary(
-        cls, existing: Dict[str, str], new_terms: Dict[str, str]
+    def normalize_and_merge_dict(
+        cls, existing: Dict[str, str], new_items: Dict[str, str]
     ) -> Dict[str, str]:
         key_map = {k.strip().lower(): k for k in existing}
         merged = dict(existing)
-        for raw_k, raw_v in new_terms.items():
+        for raw_k, raw_v in new_items.items():
             if isinstance(raw_k, str) and isinstance(raw_v, str):
                 k = raw_k.strip()
                 v = raw_v.strip()
@@ -227,37 +226,46 @@ class Guardrails:
 
     @classmethod
     def parse_analysis(
-        cls, raw_text: str, fallback_summary: str, existing_glossary: Dict[str, str]
-    ) -> Tuple[str, Dict[str, str]]:
+        cls,
+        raw_text: str,
+        fallback_summary: str,
+        existing_glossary: Dict[str, str],
+        existing_notes: Dict[str, str],
+    ) -> Tuple[str, Dict[str, str], Dict[str, str]]:
         if not raw_text or cls.is_refusal(raw_text):
-            return fallback_summary, existing_glossary
+            return fallback_summary, existing_glossary, existing_notes
 
         cleaned = cls.extract_json_block(raw_text)
         try:
             data = json_repair.loads(cleaned)
             if not isinstance(data, dict):
-                return fallback_summary, existing_glossary
+                return fallback_summary, existing_glossary, existing_notes
 
             summary = data.get("summary")
             glossary = data.get("new_glossary")
+            notes = data.get("context_notes")
 
             clean_summary = fallback_summary
             if isinstance(summary, str) and len(summary.strip()) > 10 and not cls.is_refusal(summary):
                 clean_summary = summary.strip()
 
             raw_glossary = glossary if isinstance(glossary, dict) else {}
-            updated_glossary = cls.normalize_and_merge_glossary(existing_glossary, raw_glossary)
-            return clean_summary, updated_glossary
+            raw_notes = notes if isinstance(notes, dict) else {}
+
+            updated_glossary = cls.normalize_and_merge_dict(existing_glossary, raw_glossary)
+            updated_notes = cls.normalize_and_merge_dict(existing_notes, raw_notes)
+
+            return clean_summary, updated_glossary, updated_notes
         except Exception:
-            return fallback_summary, existing_glossary
+            return fallback_summary, existing_glossary, existing_notes
 
 
 # ==========================================
-# 3. КЭШИРОВАНИЕ
+# 3. КЭШИРОВАНИЕ И ИНВАЛИДАЦИЯ
 # ==========================================
 
 class CacheManager:
-    """Управление кэшем на диске."""
+    """Управление файловым кэшем с поддержкой точечного сброса глав."""
 
     def __init__(self, cache_root: Path, book_id: str):
         self.book_cache_dir = cache_root / book_id
@@ -269,6 +277,17 @@ class CacheManager:
     def _text_path(self, idx: int) -> Path:
         return self.book_cache_dir / f"{idx:03d}.txt"
 
+    def invalidate_chapters(self, chapter_indices: Set[int]) -> None:
+        """Сброс кэша для указанных номеров глав."""
+        for idx in chapter_indices:
+            t_path = self._text_path(idx)
+            m_path = self._meta_path(idx)
+            if t_path.exists():
+                t_path.unlink()
+                logger.info("Сброшен кэш перевода главы %d", idx)
+            if m_path.exists():
+                m_path.unlink()
+
     def load_meta(self, idx: int) -> Optional[ChapterMeta]:
         path = self._meta_path(idx)
         if not path.exists():
@@ -279,6 +298,7 @@ class CacheManager:
                 return ChapterMeta(
                     summary=data.get("summary", ""),
                     glossary=data.get("glossary", {}),
+                    context_notes=data.get("context_notes", {}),
                 )
         except Exception as e:
             logger.warning("Ошибка чтения метаданных главы %d: %s", idx, e)
@@ -288,7 +308,16 @@ class CacheManager:
         path = self._meta_path(idx)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump({"summary": meta.summary, "glossary": meta.glossary}, f, ensure_ascii=False, indent=2)
+                json.dump(
+                    {
+                        "summary": meta.summary,
+                        "glossary": meta.glossary,
+                        "context_notes": meta.context_notes,
+                    },
+                    f,
+                    ensure_ascii=False,
+                    indent=2,
+                )
         except Exception as e:
             logger.error("Ошибка сохранения метаданных главы %d: %s", idx, e)
 
@@ -315,7 +344,7 @@ class CacheManager:
 
 
 # ==========================================
-# 4. АСИНХРОННЫЙ LLM СЕРВИС (TOKEN PROTECT)
+# 4. АСИНХРОННЫЙ LLM СЕРВИС
 # ==========================================
 
 class AsyncLLMService:
@@ -356,11 +385,10 @@ class AsyncLLMService:
 
                     response = await self.client.chat.completions.create(**kwargs)
                     if not response.choices or not response.choices[0].message.content:
-                        raise ValueError("Модель вернула пустой ответ (NoneType)")
+                        raise ValueError("Модель вернула пустой ответ")
 
                     content = response.choices[0].message.content.strip()
 
-                    # Сохраняем непустой ответ как резервный
                     if len(content) > 30 and not Guardrails.is_refusal(content):
                         best_candidate = content
 
@@ -370,7 +398,6 @@ class AsyncLLMService:
                     if not is_pass1 and Guardrails.is_degenerated(content):
                         raise ValueError("Ответ отбракован фильтром дегенерации.")
 
-                    # Считаем токены
                     usage = getattr(response, "usage", None)
                     if usage:
                         p_tok = getattr(usage, "prompt_tokens", 0) or 0
@@ -394,7 +421,6 @@ class AsyncLLMService:
                     )
                     await asyncio.sleep(sleep_time)
 
-        # FAIL-SAFE защита от дыр в сюжете
         if best_candidate and len(best_candidate) > 50:
             logger.warning("[Fail-Safe] Использован лучший доступный ответ.")
             return best_candidate
@@ -431,7 +457,7 @@ class EpubService:
     @classmethod
     def build_epub(cls, chapters: List[str], output_path: Path, title: str) -> None:
         book = epub.EpubBook()
-        book.set_identifier("ai-literary-pipeline-async-v3.7")
+        book.set_identifier("ai-literary-pipeline-async-v4.0")
         book.set_title(title)
         book.set_language("ru")
         book.add_author("AI Literary Translator")
@@ -466,7 +492,7 @@ class EpubService:
 
 
 # ==========================================
-# 6. КОНВЕЙЕРНЫЙ ПАЙПЛАЙН
+# 6. КОНВЕЙЕРНЫЙ ПАЙПЛАЙН С MIRROR REGISTER
 # ==========================================
 
 class AsyncTranslationPipeline:
@@ -481,6 +507,7 @@ class AsyncTranslationPipeline:
         text: str,
         prev_summary: str,
         accumulated_glossary: Dict[str, str],
+        accumulated_notes: Dict[str, str],
         cache: CacheManager,
     ) -> ChapterMeta:
         cached_meta = cache.load_meta(idx)
@@ -488,18 +515,19 @@ class AsyncTranslationPipeline:
             return cached_meta
 
         analysis_prompt = (
-            "You are a professional literary editor and translator. Analyze the text and output strictly valid JSON:\n"
+            "You are a professional literary editor. Analyze the text and output strictly valid JSON:\n"
             "{\n"
             '  "summary": "Brief plot summary in Russian (max 120 words)",\n'
             '  "new_glossary": {\n'
-            '    "Character Name": "Русский перевод (Пол: М / Ж / Ср)",\n'
-            '    "Term/Concept": "Русский перевод"\n'
-            "  }\n"
+            '    "Character/Entity": "Русский перевод (Пол: М / Ж / Ср)"\n'
+            '  },\n'
+            '  "context_notes": {\n'
+            '    "idiom / ambiguous slang / metaphor": "Контекстный смысл и перевод в этой сцене (избегать буквального перевода)"\n'
+            '  }\n'
             "}\n"
-            "Rules for new_glossary:\n"
-            "- Carefully determine character gender by examining English pronouns in context (she/her -> Ж, he/him -> М).\n"
-            "- Always specify gender for characters explicitly, e.g.: 'OriginalName': 'РусскоеИмя (Пол: Ж)'.\n"
-            "- Use natural Russian phonetics and established translation conventions.\n"
+            "Rules:\n"
+            "- Determine character gender by analyzing surrounding English pronouns (she/her -> Ж, he/him -> М).\n"
+            "- Extract tricky idioms, figurative expressions, or polysemic slang where machine translation might fail.\n"
             "- Do not include items already present in Known glossary.\n"
             "- Output raw JSON only."
         )
@@ -519,13 +547,21 @@ class AsyncTranslationPipeline:
                 temperature=0.2,
                 is_pass1=True,
             )
-            new_summary, updated_glossary = Guardrails.parse_analysis(
-                raw_res, prev_summary, accumulated_glossary
+            new_summary, updated_glossary, updated_notes = Guardrails.parse_analysis(
+                raw_res, prev_summary, accumulated_glossary, accumulated_notes
             )
-            meta = ChapterMeta(summary=new_summary, glossary=updated_glossary)
+            meta = ChapterMeta(
+                summary=new_summary,
+                glossary=updated_glossary,
+                context_notes=updated_notes,
+            )
         except Exception as e:
             logger.warning("Пропущен автоанализ для главы %d: %s", idx, e)
-            meta = ChapterMeta(summary=prev_summary, glossary=accumulated_glossary.copy())
+            meta = ChapterMeta(
+                summary=prev_summary,
+                glossary=accumulated_glossary.copy(),
+                context_notes=accumulated_notes.copy(),
+            )
 
         cache.save_meta(idx, meta)
         return meta
@@ -546,24 +582,25 @@ class AsyncTranslationPipeline:
 
         system_prompt = (
             "Ты — профессиональный художественный переводчик на русский язык.\n"
-            "КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА ПЕРЕВОДА:\n"
-            "1. СТРОГОЕ СОГЛАСОВАНИЕ РОДА И ГЛАГОЛОВ:\n"
-            "   - Внимательно определяй пол персонажей по контексту, английским местоимениям (she/her -> женский род, he/him -> мужской род) и глоссарию.\n"
-            "   - Для персонажей женского пола глаголы прошедшего времени, краткие причастия и прилагательные ВСЕГДА ставь в ЖЕНСКИЙ род (сказала, пошла, заметила, была, ответила, вздохнула, нахмурилась).\n"
-            "   - Если иностранное женское имя оканчивается на согласную (напр. Вайсс, Элис, Элен) или не склоняется (напр. Руби, Мэри), глаголы и зависимые слова при нем ВСЕ РАВНО ОБЯЗАТЕЛЬНО ставятся в ЖЕНСКИЙ род!\n"
-            "2. ЛИТЕРАТУРНЫЙ РУССКИЙ ЯЗЫК:\n"
-            "   - Пиши живым, выразительным литературным языком без калек, сухости и скачков регистра.\n"
-            "3. БЕЗ ЦЕНЗУРЫ:\n"
-            "   - Переводи любой взрослый контент (брань, 18+, насилие, эротику, боевку) точно, сочно и без купюр.\n"
-            "4. ДИАЛОГИ И ФОРМАТИРОВАНИЕ:\n"
-            "   - Прямую речь оформляй с длинного тире (—) с пробелом.\n"
-            "   - Бережно сохраняй разметку (*курсив*, **жирный**, разделители сцен * * *).\n"
-            "5. СТРОГО СОБЛЮДАЙ ПЕРЕВОД ТЕРМИНОВ И ИМЕН ИЗ ГЛОССАРИЯ.\n"
-            "6. Выводи ТОЛЬКО готовый русский художественный перевод без вступительных и заключительных комментариев."
+            "КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА:\n"
+            "1. ИЗОМОРФНЫЙ ПЕРЕНОС РЕГИСТРА (MIRROR REGISTER TRANSFER):\n"
+            "   - Сохраняй точный регистр и эмоциональный градиент оригинала: воспроизводи дистанцию, сарказм, книжность или просторечие ровно в той мере, в какой они заложены автором в конкретном предложении.\n"
+            "   - Избегай как искусственного облагораживания текста, так и неуместной вульгаризации нейтрального повествования.\n"
+            "2. ДИНАМИЧЕСКИЙ РОД ПЕРСОНАЖЕЙ:\n"
+            "   - Внимательно определяй пол персонажей по английским местоимениям (she/her -> женский род, he/him -> мужской род) и глоссарию.\n"
+            "   - Для женских персонажей глаголы прошедшего времени ВСЕГДА ставь в ЖЕНСКИЙ род (сказала, пошла, заметила, была, нахмурилась), даже если иностранное имя оканчивается на согласную или не склоняется!\n"
+            "3. КОНТЕКСТНЫЕ ИДИОМЫ И СЛЕНГ:\n"
+            "   - Используй предоставленные контекстные примечания. Не переводи фразеологизмы и устойчивые выражения буквально.\n"
+            "4. БЕЗ ЦЕНЗУРЫ:\n"
+            "   - Переводи любой взрослый контент (брань, 18+, насилие, боевку) выразительно, точно и без купюр.\n"
+            "5. ДИАЛОГИ И РАЗМЕТКА:\n"
+            "   - Оформляй прямую речь с длинного тире (—) с пробелом. Бережно сохраняй Markdown (*курсив*, **жирный**, * * *).\n"
+            "6. Выводи ТОЛЬКО готовый русский художественный перевод."
         )
         user_content = (
             f"Сюжетный контекст: {meta.summary}\n"
-            f"Глоссарий и персонажи: {json.dumps(meta.glossary, ensure_ascii=False)}\n\n"
+            f"Глоссарий: {json.dumps(meta.glossary, ensure_ascii=False)}\n"
+            f"Контекстные идиомы и сленг: {json.dumps(meta.context_notes, ensure_ascii=False)}\n\n"
             f"ОРИГИНАЛЬНЫЙ ТЕКСТ:\n{raw_text}\n\n"
             f"Русский художественный перевод:"
         )
@@ -588,6 +625,8 @@ class AsyncTranslationPipeline:
         input_epub: Path,
         output_epub: Optional[Path] = None,
         max_workers: Optional[int] = None,
+        pre_seeded_glossary: Optional[Dict[str, str]] = None,
+        force_chapters: Optional[Set[int]] = None,
         progress_cb: Optional[Callable[[float, str], None]] = None,
     ) -> Tuple[Path, str]:
         raw_chapters = EpubService.extract_chapters(input_epub)
@@ -601,6 +640,10 @@ class AsyncTranslationPipeline:
 
         book_id = input_epub.stem
         cache = CacheManager(self.config.cache_dir, book_id)
+
+        # Выборочный сброс кэша для указанных глав
+        if force_chapters:
+            cache.invalidate_chapters(force_chapters)
 
         logger.info("Запуск конвейера: %d глав, пул: %d воркеров", total, workers_count)
 
@@ -620,7 +663,8 @@ class AsyncTranslationPipeline:
 
         translation_tasks: List[asyncio.Task] = []
         current_summary = "Начало книги."
-        accumulated_glossary: Dict[str, str] = {}
+        accumulated_glossary = dict(pre_seeded_glossary or {})
+        accumulated_notes: Dict[str, str] = {}
 
         for idx, text in enumerate(raw_chapters, 1):
             update_progress(f"Анализ сюжета главы {idx}/{total}")
@@ -630,10 +674,12 @@ class AsyncTranslationPipeline:
                 text=text,
                 prev_summary=current_summary,
                 accumulated_glossary=accumulated_glossary,
+                accumulated_notes=accumulated_notes,
                 cache=cache,
             )
             current_summary = meta.summary
             accumulated_glossary = meta.glossary
+            accumulated_notes = meta.context_notes
             analyzed_chapters += 1
 
             task = asyncio.create_task(
@@ -657,7 +703,9 @@ class AsyncTranslationPipeline:
                 translated_chapters.append(f"[Ошибка перевода главы {i}: {res}]")
             else:
                 _, text = res
-                translated_chapters.append(text)
+                # Детерминированный линтинг пунктуации
+                linted_text = TextFormatter.post_lint(text, accumulated_glossary)
+                translated_chapters.append(linted_text)
 
         if output_epub is None:
             output_epub = input_epub.parent / f"{book_id}_RU.epub"
@@ -682,18 +730,67 @@ class AsyncTranslationPipeline:
 # ==========================================
 
 def parse_model_list(models_str: str, default_list: List[str]) -> List[str]:
-    """Парсит список моделей через запятую."""
     if not models_str or not models_str.strip():
         return default_list
     models = [m.strip() for m in models_str.split(",") if m.strip()]
     return models if models else default_list
 
 
+def parse_glossary_input(raw_glossary: str) -> Dict[str, str]:
+    """Парсит глоссарий из формата JSON или строк 'Ключ = Значение'."""
+    if not raw_glossary or not raw_glossary.strip():
+        return {}
+    raw_glossary = raw_glossary.strip()
+    if raw_glossary.startswith("{"):
+        try:
+            return json.loads(raw_glossary)
+        except Exception:
+            pass
+    glossary = {}
+    for line in raw_glossary.splitlines():
+        line = line.strip()
+        if "=" in line:
+            k, v = line.split("=", 1)
+            glossary[k.strip()] = v.strip()
+        elif ":" in line:
+            k, v = line.split(":", 1)
+            glossary[k.strip()] = v.strip()
+    return glossary
+
+
+def parse_chapter_ranges(raw_str: str) -> Set[int]:
+    """Парсит номера глав: '3, 9, 108-114' -> {3, 9, 108, 109, 110, 111, 112, 113, 114}."""
+    if not raw_str or not raw_str.strip():
+        return set()
+    result = set()
+    for part in raw_str.split(","):
+        part = part.strip()
+        if "-" in part:
+            try:
+                start, end = map(int, part.split("-"))
+                result.update(range(start, end + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                result.add(int(part))
+            except ValueError:
+                pass
+    return result
+
+
 def launch_web_gui():
     import gradio as gr
 
     async def web_process(
-        epub_file, api_key: str, workers: int, models_p1_raw: str, models_p2_raw: str, progress=gr.Progress()
+        epub_file,
+        api_key: str,
+        workers: int,
+        models_p1_raw: str,
+        models_p2_raw: str,
+        custom_glossary_raw: str,
+        force_chapters_raw: str,
+        progress=gr.Progress(),
     ):
         if not epub_file:
             return None, "Загрузите .epub файл."
@@ -702,6 +799,8 @@ def launch_web_gui():
 
         p1_models = parse_model_list(models_p1_raw, ["deepseek/deepseek-v3.2"])
         p2_models = parse_model_list(models_p2_raw, ["deepseek/deepseek-v3.2"])
+        pre_glossary = parse_glossary_input(custom_glossary_raw)
+        force_chs = parse_chapter_ranges(force_chapters_raw)
 
         cfg = PipelineConfig(
             max_concurrent_translations=int(workers),
@@ -717,6 +816,8 @@ def launch_web_gui():
             out_path, stats = await pipeline.run(
                 input_epub=Path(epub_file.name),
                 max_workers=int(workers),
+                pre_seeded_glossary=pre_glossary,
+                force_chapters=force_chs,
                 progress_cb=cb,
             )
             return str(out_path), f"Перевод успешно завершен!\n\n{stats}"
@@ -725,7 +826,7 @@ def launch_web_gui():
             return None, f"Ошибка пайплайна: {e}"
 
     with gr.Blocks(title="AI Literary Novel Translator") as ui:
-        gr.Markdown("## ⚡ Fast Async AI Literary Translator (Stable Engine v3.7)")
+        gr.Markdown("## ⚡ Fast Async AI Literary Translator (Universal Engine v4.0)")
         with gr.Row():
             with gr.Column():
                 f_in = gr.File(label="Исходный EPUB", file_types=[".epub"])
@@ -739,30 +840,41 @@ def launch_web_gui():
                     minimum=2, maximum=30, value=15, step=1, label="Параллельных глав (Concurrency)"
                 )
                 m1_in = gr.Textbox(
-                    label="Модели Фазы 1 (Анализ сюжета и глоссарий, через запятую)",
+                    label="Модели Фазы 1 (Анализ сюжета и глоссарий)",
                     value="deepseek/deepseek-v3.2",
                 )
                 m2_in = gr.Textbox(
-                    label="Модели Фазы 2 (Художественный перевод, через запятую)",
+                    label="Модели Фазы 2 (Художественный перевод)",
                     value="deepseek/deepseek-v3.2",
+                )
+                g_in = gr.Textbox(
+                    label="Канонический глоссарий (Опционально, 'Оригинал = Перевод')",
+                    lines=4,
+                    placeholder="Weiss = Вайсс (Пол: Ж)\nBeacon = Бикон\nFaunus = Фавн",
+                )
+                ch_in = gr.Textbox(
+                    label="Перевести заново только главы (Опционально, напр: '3, 9, 108-114')",
+                    placeholder="Оставьте пустым для перевода всей книги",
                 )
                 btn = gr.Button("Начать перевод", variant="primary")
             with gr.Column():
-                st = gr.Textbox(label="Статус и статистика", interactive=False, lines=5)
+                st = gr.Textbox(label="Статус и статистика", interactive=False, lines=6)
                 f_out = gr.File(label="Готовая книга (.epub)")
 
-        btn.click(web_process, inputs=[f_in, k_in, w_in, m1_in, m2_in], outputs=[f_out, st])
+        btn.click(web_process, inputs=[f_in, k_in, w_in, m1_in, m2_in, g_in, ch_in], outputs=[f_out, st])
 
     ui.launch(inbrowser=True)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Async Fast AI Literary Translator v3.7")
+    parser = argparse.ArgumentParser(description="Async Fast AI Literary Translator v4.0")
     parser.add_argument("--file", type=Path, help="Входной .epub файл")
     parser.add_argument("--key", default=os.getenv("OPENROUTER_API_KEY"), help="OpenRouter API Key")
     parser.add_argument("--workers", type=int, default=15, help="Параллельных глав (по умолчанию 15)")
     parser.add_argument("--p1-models", default="", help="Пул моделей Фазы 1 через запятую")
     parser.add_argument("--p2-models", default="", help="Пул моделей Фазы 2 через запятую")
+    parser.add_argument("--glossary", default="", help="Канонический глоссарий (файл .json или строка)")
+    parser.add_argument("--chapters", default="", help="Перевести заново конкретные главы (напр: '3,9,108-114')")
     parser.add_argument("--gui", action="store_true", help="Запустить Web GUI")
     args = parser.parse_args()
 
@@ -772,6 +884,17 @@ def main():
         if not args.key:
             logger.error("Укажите API-ключ через --key или переменную OPENROUTER_API_KEY.")
             return
+
+        pre_glossary = {}
+        if args.glossary:
+            g_path = Path(args.glossary)
+            if g_path.exists():
+                with open(g_path, "r", encoding="utf-8") as f:
+                    pre_glossary = json.load(f)
+            else:
+                pre_glossary = parse_glossary_input(args.glossary)
+
+        force_chs = parse_chapter_ranges(args.chapters)
 
         cfg = PipelineConfig(
             max_concurrent_translations=args.workers,
@@ -787,6 +910,8 @@ def main():
             pipeline.run(
                 input_epub=args.file,
                 max_workers=args.workers,
+                pre_seeded_glossary=pre_glossary,
+                force_chapters=force_chs,
                 progress_cb=cli_cb,
             )
         )
